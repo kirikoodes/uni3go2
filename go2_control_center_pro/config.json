@@ -1,0 +1,27 @@
+{
+  "transport": "udp_json",
+  "robot_ip": "192.168.12.1",
+  "udp": {
+    "robot_port": 8082,
+    "local_port": 0,
+    "json_port": 8082
+  },
+  "video": {
+    "enabled": false,
+    "mode": "MJPEG",
+    "url": "http://192.168.12.1:8080/mjpeg"
+  },
+  "gamepad": {
+    "deadzone": 0.15,
+    "gain_vx": 1.0,
+    "gain_vy": 1.0,
+    "gain_wz": 1.0,
+    "invert_ly": true,
+    "invert_lx": false,
+    "invert_rx": false
+  },
+  "safety": {
+    "watchdog_timeout_sec": 0.6,
+    "stop_repeat_hz": 10
+  }
+}
