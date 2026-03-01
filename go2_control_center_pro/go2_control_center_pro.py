@@ -22,6 +22,10 @@ def apply_deadzone(x, dz):
     s = 1 if x >= 0 else -1
     return s * (abs(x) - dz) / (1.0 - dz)
 
+def is_http_url(url):
+    parsed = urlparse(url)
+    return (parsed.scheme or "http").lower() in ("http", "https")
+
 def build_mjpeg_candidates(url):
     """Build a short list of likely MJPEG endpoints from a user-provided URL."""
     parsed = urlparse(url)
@@ -64,7 +68,8 @@ def build_video_architecture_hint(url):
     host = parsed.hostname or "robot"
     return (
         f". On Go2, no default MJPEG endpoint is guaranteed by Unitree architecture; "
-        f"configure the exact URL of your video bridge/server for {host}."
+        f"video is commonly transported via WebRTC/DTLS or other streams, so configure "
+        f"an explicit MJPEG bridge/server URL for {host}."
     )
 
 class Config:
@@ -258,6 +263,12 @@ class VideoMJPEGViewer(ttk.Frame):
 
         if self._running:
             return True
+        if not is_http_url(url):
+            hint = "Video tab supports MJPEG over HTTP(S). For Go2 WebRTC/DTLS streams, use a bridge to MJPEG first."
+            self.log(f"[VIDEO] unsupported URL scheme for built-in viewer: {url}. {hint}")
+            self.canvas.configure(text=f"Video error: {hint}", image="")
+            return False
+
         self._running = True
         self.canvas.configure(text="Connecting video...", image="")
 

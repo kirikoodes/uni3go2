@@ -48,3 +48,9 @@ Vidéo (important)
 - D’après l’architecture Unitree Go2, un endpoint MJPEG HTTP standard n’est pas garanti par défaut.
 - Si `http://192.168.12.1:8080/mjpeg` refuse la connexion, c’est souvent normal: il faut une source vidéo dédiée (bridge MJPEG/serveur caméra) et renseigner son URL exacte dans l’onglet Video.
 - L’app teste maintenant quelques chemins MJPEG courants sur le même port pour aider au diagnostic, mais ne "devine" plus des ports alternatifs.
+
+WebRTC / DTLS (utile ?)
+- Oui, c'est souvent le mode vidéo natif le plus réaliste sur Go2.
+- Cette application intègre seulement un viewer MJPEG HTTP(S) dans l'UI.
+- Si ta source est WebRTC/DTLS, ajoute un bridge (WebRTC -> MJPEG) puis configure l'URL MJPEG dans l’onglet Video.
+- En pratique: WebRTC/DTLS pour faible latence, MJPEG pour simplicité d’intégration Tkinter.
