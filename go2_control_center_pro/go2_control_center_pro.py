@@ -1,6 +1,6 @@
 
 # -*- coding: utf-8 -*-
-import os, sys, json, time, threading, socket, subprocess, platform
+import os, sys, json, time, threading, socket, subprocess, platform, warnings, importlib.util
 from urllib.parse import urlparse
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -8,6 +8,9 @@ from tkinter import ttk, messagebox, filedialog
 APP_TITLE = "Go2 Control Center — PRO"
 CONFIG_FILE = "config.json"
 REQ_FILE = "requirements.txt"
+
+# Hide pygame startup banner in console output.
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 def now():
     return time.time()
@@ -463,12 +466,14 @@ class App(tk.Tk):
 
     # ---------- actions ----------
     def check_deps(self):
-        missing = []
-        for mod in ("pygame","requests","PIL"):
-            try:
-                __import__(mod if mod != "PIL" else "PIL.Image")
-            except Exception:
-                missing.append(mod)
+        # Avoid importing modules here to prevent noisy import-time warnings/logs.
+        deps = {
+            "pygame": "pygame",
+            "requests": "requests",
+            "PIL": "PIL",
+        }
+        missing = [label for label, module_name in deps.items() if importlib.util.find_spec(module_name) is None]
+
         if missing:
             self.dep_var.set("Missing: " + ", ".join(missing))
             self._log("[SETUP] Missing deps: " + ", ".join(missing))
@@ -621,7 +626,13 @@ class App(tk.Tk):
             messagebox.showwarning("Teleop", "Connect transport first (Setup tab).")
             return
         try:
-            import pygame
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="pkg_resources is deprecated as an API.*",
+                    category=UserWarning,
+                )
+                import pygame
         except Exception as e:
             messagebox.showerror("Teleop", f"pygame missing: {e}\nUse Setup -> Install dependencies.")
             return
@@ -631,7 +642,6 @@ class App(tk.Tk):
         self._log("[GAMEPAD] starting")
 
         def loop():
-            import pygame
             pygame.init()
             pygame.joystick.init()
 
