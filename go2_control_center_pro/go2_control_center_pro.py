@@ -1,12 +1,16 @@
 
 # -*- coding: utf-8 -*-
-import os, sys, json, time, threading, socket, subprocess, platform
+import os, sys, json, time, threading, socket, subprocess, platform, warnings, importlib.util
+from urllib.parse import urlparse
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
 APP_TITLE = "Go2 Control Center — PRO"
 CONFIG_FILE = "config.json"
 REQ_FILE = "requirements.txt"
+
+# Hide pygame startup banner in console output.
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 def now():
     return time.time()
@@ -244,8 +248,15 @@ class VideoMJPEGViewer(ttk.Frame):
                         except Exception:
                             pass
             except Exception as e:
-                self.log(f"[VIDEO] error: {e}")
-                self.canvas.after(0, lambda: self.canvas.configure(text=f"Video error: {e}", image=""))
+                hint = ""
+                err_text = str(e)
+                if "Failed to establish a new connection" in err_text or "10061" in err_text:
+                    parsed = urlparse(url)
+                    host = parsed.hostname or "robot"
+                    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+                    hint = f" (connection refused on {host}:{port})"
+                self.log(f"[VIDEO] error: {e}{hint}")
+                self.canvas.after(0, lambda: self.canvas.configure(text=f"Video error: {e}{hint}", image=""))
             self._running = False
         import io
         self._thread = threading.Thread(target=loop, daemon=True)
@@ -275,6 +286,8 @@ class App(tk.Tk):
 
         self._watchdog_thread = None
         self._watchdog_running = True
+
+        self._deps_installing = False
 
         self._build_ui()
         self._start_watchdog()
@@ -453,12 +466,14 @@ class App(tk.Tk):
 
     # ---------- actions ----------
     def check_deps(self):
-        missing = []
-        for mod in ("pygame","requests","PIL"):
-            try:
-                __import__(mod if mod != "PIL" else "PIL.Image")
-            except Exception:
-                missing.append(mod)
+        # Avoid importing modules here to prevent noisy import-time warnings/logs.
+        deps = {
+            "pygame": "pygame",
+            "requests": "requests",
+            "PIL": "PIL",
+        }
+        missing = [label for label, module_name in deps.items() if importlib.util.find_spec(module_name) is None]
+
         if missing:
             self.dep_var.set("Missing: " + ", ".join(missing))
             self._log("[SETUP] Missing deps: " + ", ".join(missing))
@@ -467,6 +482,12 @@ class App(tk.Tk):
             self._log("[SETUP] All deps OK")
 
     def install_deps(self):
+        if self._deps_installing:
+            self._log("[SETUP] Install already in progress")
+            return
+
+        self._deps_installing = True
+
         # run pip in a background thread
         def run():
             self._log("[SETUP] Installing dependencies...")
@@ -480,6 +501,9 @@ class App(tk.Tk):
                 self.check_deps()
             except Exception as e:
                 self._log(f"[SETUP] install error: {e}")
+            finally:
+                self._deps_installing = False
+
         threading.Thread(target=run, daemon=True).start()
 
     def save_network_cfg(self):
@@ -602,7 +626,13 @@ class App(tk.Tk):
             messagebox.showwarning("Teleop", "Connect transport first (Setup tab).")
             return
         try:
-            import pygame
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="pkg_resources is deprecated as an API.*",
+                    category=UserWarning,
+                )
+                import pygame
         except Exception as e:
             messagebox.showerror("Teleop", f"pygame missing: {e}\nUse Setup -> Install dependencies.")
             return
@@ -612,7 +642,6 @@ class App(tk.Tk):
         self._log("[GAMEPAD] starting")
 
         def loop():
-            import pygame
             pygame.init()
             pygame.joystick.init()
 
