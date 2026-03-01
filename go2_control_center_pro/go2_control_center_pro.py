@@ -1,6 +1,6 @@
 
 # -*- coding: utf-8 -*-
-import os, sys, json, time, threading, socket, subprocess, platform
+import os, sys, json, time, threading, socket, subprocess, platform, ipaddress
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -27,11 +27,33 @@ class Config:
         self.load()
 
     def load(self):
+        defaults = {
+            "transport": "udp_json",
+            "robot_ip": "192.168.12.1",
+            "udp": {"robot_port": 8082, "local_port": 0, "json_port": 8082, "level": "HIGHLEVEL"},
+            "video": {"enabled": False, "mode": "MJPEG", "url": ""},
+            "gamepad": {
+                "deadzone": 0.15,
+                "gain_vx": 1.0,
+                "gain_vy": 1.0,
+                "gain_wz": 1.0,
+                "invert_ly": True,
+                "invert_lx": False,
+                "invert_rx": False,
+            },
+            "safety": {"watchdog_timeout_sec": 0.6, "send_hz": 50},
+        }
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 self.data = json.load(f)
         else:
             self.data = {}
+        for k, v in defaults.items():
+            if k not in self.data:
+                self.data[k] = v
+            elif isinstance(v, dict):
+                for sk, sv in v.items():
+                    self.data[k].setdefault(sk, sv)
 
     def save(self):
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -137,7 +159,9 @@ class Sdk2Transport(TransportBase):
 
     def connect(self, cfg):
         try:
+            from unitree.robot.channel.channel_factory import ChannelFactoryInitialize
             from unitree.robot.go2.sport.sport_client import SportClient
+            ChannelFactoryInitialize(0, cfg["robot_ip"])
             self.sport = SportClient()
             if not self.sport.Init():
                 self.log("[SDK2] SportClient Init failed")
@@ -169,6 +193,15 @@ class Sdk2Transport(TransportBase):
         # Minimal safe actions. Others can be added once you confirm availability.
         m = str(action)
         try:
+            aliases = {
+                "standup": "StandUp",
+                "standdown": "StandDown",
+                "sit": "StandDown",
+                "damp": "Damp",
+                "balance": "BalanceStand",
+                "stopmove": "StopMove",
+            }
+            m = aliases.get(m.lower(), m)
             fn = getattr(self.sport, m, None)
             if callable(fn):
                 fn()
@@ -275,9 +308,19 @@ class App(tk.Tk):
 
         self._watchdog_thread = None
         self._watchdog_running = True
+        self._send_thread = None
+        self._send_running = True
+
+        self._target_vx = 0.0
+        self._target_vy = 0.0
+        self._target_wz = 0.0
+        self._cmd_lock = threading.Lock()
+        self._keys_down = set()
+        self._keyboard_enabled = False
 
         self._build_ui()
         self._start_watchdog()
+        self._start_sender_loop()
 
     # ---------- UI ----------
     def _build_ui(self):
@@ -379,14 +422,20 @@ class App(tk.Tk):
         self.port_entry.grid(row=0, column=1, sticky="w", padx=8)
 
         ttk.Button(f, text="Save config", command=self.save_network_cfg).grid(row=4, column=0, sticky="w", pady=(6,0))
+        ttk.Label(
+            f,
+            text="Tip: connect your PC to the robot Wi-Fi, then set robot IP (default Go2: 192.168.12.1).",
+            foreground="#666"
+        ).grid(row=5, column=0, sticky="w", pady=(8,0))
 
-        ttk.Separator(f).grid(row=5, column=0, sticky="ew", pady=14)
+        ttk.Separator(f).grid(row=6, column=0, sticky="ew", pady=14)
 
-        ttk.Label(f, text="Tests", font=("Segoe UI", 11, "bold")).grid(row=6, column=0, sticky="w")
+        ttk.Label(f, text="Tests", font=("Segoe UI", 11, "bold")).grid(row=7, column=0, sticky="w")
         tbtns = ttk.Frame(f)
-        tbtns.grid(row=7, column=0, sticky="ew", pady=8)
+        tbtns.grid(row=8, column=0, sticky="ew", pady=8)
         ttk.Button(tbtns, text="ICMP Ping (OS ping)", command=self.icmp_ping).pack(side="left")
         ttk.Button(tbtns, text="UDP Ping (send test packet)", command=self.udp_ping).pack(side="left", padx=8)
+        ttk.Button(tbtns, text="Check Wi-Fi route", command=self.check_wifi_route).pack(side="left", padx=8)
 
     def _build_teleop_tab(self):
         f = self.tab_teleop
@@ -421,6 +470,8 @@ class App(tk.Tk):
         btns.grid(row=row, column=0, sticky="ew", pady=8); row += 1
         ttk.Button(btns, text="Start gamepad", command=self.start_gamepad).pack(side="left")
         ttk.Button(btns, text="Stop gamepad", command=self.stop_gamepad).pack(side="left", padx=8)
+        ttk.Button(btns, text="Enable keyboard", command=self.enable_keyboard).pack(side="left", padx=8)
+        ttk.Button(btns, text="Disable keyboard", command=self.disable_keyboard).pack(side="left", padx=8)
         ttk.Button(btns, text="STOP NOW", command=self.stop_now).pack(side="left", padx=8)
 
         self.motion_var = tk.StringVar(value="vx=0.00 vy=0.00 wz=0.00")
@@ -433,6 +484,44 @@ class App(tk.Tk):
         ttk.Label(f, text="Timeout (sec)").grid(row=row, column=0, sticky="w", pady=(8,2)); row += 1
         ttk.Scale(f, from_=0.2, to=3.0, orient="horizontal", variable=self.wd_var).grid(row=row, column=0, sticky="ew"); row += 1
         ttk.Button(f, text="Save teleop settings", command=self.save_teleop_cfg).grid(row=row, column=0, sticky="w", pady=10)
+        row += 1
+        ttk.Label(f, text="Keyboard: Z/S = vx | Q/D = vy | E/R = yaw", foreground="#666").grid(row=row, column=0, sticky="w")
+        row += 1
+
+        ttk.Separator(f).grid(row=row, column=0, sticky="ew", pady=14); row += 1
+        ttk.Label(f, text="Robot actions (movement library)", font=("Segoe UI", 11, "bold")).grid(row=row, column=0, sticky="w"); row += 1
+
+        preset = ttk.Frame(f)
+        preset.grid(row=row, column=0, sticky="ew", pady=(8,2)); row += 1
+        self.action_var = tk.StringVar(value="StandUp")
+        self.action_combo = ttk.Combobox(
+            preset,
+            textvariable=self.action_var,
+            state="readonly",
+            values=["StandUp", "StandDown", "Damp", "BalanceStand", "StopMove"]
+        )
+        self.action_combo.pack(side="left", fill="x", expand=True)
+        ttk.Button(preset, text="Run action", command=self.run_selected_action).pack(side="left", padx=8)
+
+        custom = ttk.Frame(f)
+        custom.grid(row=row, column=0, sticky="ew", pady=(4,2)); row += 1
+        self.custom_action_var = tk.StringVar(value="")
+        ttk.Entry(custom, textvariable=self.custom_action_var).pack(side="left", fill="x", expand=True)
+        ttk.Button(custom, text="Run custom method", command=self.run_custom_action).pack(side="left", padx=8)
+
+        ttk.Label(
+            f,
+            text="SDK2: preset actions + custom method name (exact Unitree SDK method) for full movement library.",
+            foreground="#666"
+        ).grid(row=row, column=0, sticky="w"); row += 1
+
+        ttk.Separator(f).grid(row=row, column=0, sticky="ew", pady=14); row += 1
+        ttk.Label(f, text="Robot lights", font=("Segoe UI", 11, "bold")).grid(row=row, column=0, sticky="w"); row += 1
+        ttk.Scale(f, from_=0, to=10, orient="horizontal", variable=self.light_level).grid(row=row, column=0, sticky="ew", pady=(6,2)); row += 1
+        lbtns = ttk.Frame(f)
+        lbtns.grid(row=row, column=0, sticky="w", pady=(2,0)); row += 1
+        ttk.Button(lbtns, text="Apply light level", command=self.apply_light_level).pack(side="left")
+        ttk.Button(lbtns, text="Lights OFF", command=lambda: self.set_light_level(0)).pack(side="left", padx=8)
 
     def _build_video_tab(self):
         f = self.tab_video
@@ -483,7 +572,11 @@ class App(tk.Tk):
         threading.Thread(target=run, daemon=True).start()
 
     def save_network_cfg(self):
-        self.cfg.data["robot_ip"] = self.ip_entry.get().strip()
+        ip = self.ip_entry.get().strip()
+        if not self._is_valid_ipv4(ip):
+            messagebox.showerror("Saved", "Robot IP is invalid. Example: 192.168.12.1")
+            return
+        self.cfg.data["robot_ip"] = ip
         self.cfg.data.setdefault("udp", {})
         self.cfg.data["udp"]["robot_port"] = int(self.port_entry.get().strip())
         # also set json_port for udp_json
@@ -506,6 +599,16 @@ class App(tk.Tk):
 
     def connect_transport(self):
         self.cfg.load()
+        robot_ip = self.cfg.data.get("robot_ip", "").strip()
+        if not self._is_valid_ipv4(robot_ip):
+            messagebox.showerror("Network", "Robot IP is invalid or empty. Save a valid IP first.")
+            return
+
+        local_ip = self._resolve_local_ip_for_target(robot_ip)
+        if local_ip:
+            self._log(f"[NET] Route to robot {robot_ip} via local interface {local_ip}")
+        else:
+            self._log(f"[NET] Route check failed for robot {robot_ip}. Check Wi-Fi connection.")
         self.cfg.data["transport"] = self.transport_var.get()
         self.cfg.save()
 
@@ -530,6 +633,37 @@ class App(tk.Tk):
         else:
             self.status_var.set("Disconnected")
             messagebox.showwarning("Connect failed", f"Could not connect using {name}.\nSee Logs tab.")
+
+    def _is_valid_ipv4(self, ip_text):
+        try:
+            ipaddress.IPv4Address(ip_text)
+            return True
+        except Exception:
+            return False
+
+    def _resolve_local_ip_for_target(self, robot_ip):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect((robot_ip, 9))
+                return s.getsockname()[0]
+        except Exception:
+            return None
+
+    def check_wifi_route(self):
+        ip = self.ip_entry.get().strip()
+        if not self._is_valid_ipv4(ip):
+            messagebox.showerror("Check Wi-Fi route", "Robot IP is invalid. Example: 192.168.12.1")
+            return
+        local_ip = self._resolve_local_ip_for_target(ip)
+        if not local_ip:
+            self._log(f"[NET] No local route to {ip}")
+            messagebox.showwarning("Check Wi-Fi route", "No local route found. Connect your PC to robot Wi-Fi and retry.")
+            return
+        self._log(f"[NET] Local route OK: {local_ip} -> {ip}")
+        if ip.startswith("192.168.12.") and not local_ip.startswith("192.168.12."):
+            messagebox.showwarning("Check Wi-Fi route", f"Route found ({local_ip} -> {ip}) but subnet differs from robot default 192.168.12.x.")
+        else:
+            messagebox.showinfo("Check Wi-Fi route", f"Route OK: local {local_ip} can reach robot target {ip}.")
 
     def disconnect_transport(self):
         self.stop_gamepad()
@@ -574,6 +708,42 @@ class App(tk.Tk):
             self._log(f"[UDP] ping error: {e}")
             messagebox.showerror("UDP Ping", str(e))
 
+    def run_selected_action(self):
+        self._run_action(self.action_var.get().strip())
+
+    def run_custom_action(self):
+        self._run_action(self.custom_action_var.get().strip())
+
+    def _run_action(self, action_name):
+        if not action_name:
+            messagebox.showwarning("Action", "Action name is empty")
+            return
+        if not self.transport:
+            messagebox.showwarning("Action", "Connect transport first (Setup tab).")
+            return
+        try:
+            self.transport.send_action(action_name)
+            self._log(f"[ACTION] sent: {action_name}")
+        except Exception as e:
+            self._log(f"[ACTION] error: {e}")
+            messagebox.showerror("Action", str(e))
+
+    def set_light_level(self, level):
+        self.light_level.set(int(level))
+        self.apply_light_level()
+
+    def apply_light_level(self):
+        if not self.transport:
+            messagebox.showwarning("Lights", "Connect transport first (Setup tab).")
+            return
+        try:
+            level = int(self.light_level.get())
+            self.transport.set_light(level)
+            self._log(f"[LIGHT] brightness set to {level}")
+        except Exception as e:
+            self._log(f"[LIGHT] error: {e}")
+            messagebox.showerror("Lights", str(e))
+
     def apply_video(self):
         self.cfg.data.setdefault("video", {})
         self.cfg.data["video"]["enabled"] = bool(self.video_enabled.get())
@@ -592,7 +762,7 @@ class App(tk.Tk):
         self._log("[VIDEO] stopped")
 
     def stop_now(self):
-        self._send_move(0.0, 0.0, 0.0, force=True)
+        self._set_target_move(0.0, 0.0, 0.0, update_ts=True)
 
     # ---------- teleop ----------
     def start_gamepad(self):
@@ -683,16 +853,78 @@ class App(tk.Tk):
         if not self._gamepad_running:
             return
         self._gamepad_running = False
+        self._set_target_move(0.0, 0.0, 0.0, update_ts=True)
 
     def _send_move(self, vx, vy, wz, force=False):
-        self.last_input_ts = now()
-        if not self.transport:
+        self._set_target_move(vx, vy, wz, update_ts=True)
+
+    def _set_target_move(self, vx, vy, wz, update_ts=False):
+        if update_ts:
+            self.last_input_ts = now()
+        with self._cmd_lock:
+            self._target_vx = clamp(float(vx), -1.0, 1.0)
+            self._target_vy = clamp(float(vy), -1.0, 1.0)
+            self._target_wz = clamp(float(wz), -1.0, 1.0)
+
+    def _start_sender_loop(self):
+        if self._send_thread:
             return
-        # reduce spam if unchanged
-        if not force:
-            # still send at high rate; leave as is
-            pass
-        self.transport.send_move(vx, vy, wz)
+
+        def loop():
+            while self._send_running:
+                hz = int(self.cfg.data.get("safety", {}).get("send_hz", 50))
+                hz = max(10, min(200, hz))
+                period = 1.0 / hz
+                if self.transport:
+                    with self._cmd_lock:
+                        vx, vy, wz = self._target_vx, self._target_vy, self._target_wz
+                    self.transport.send_move(vx, vy, wz)
+                time.sleep(period)
+
+        self._send_thread = threading.Thread(target=loop, daemon=True)
+        self._send_thread.start()
+
+    def enable_keyboard(self):
+        if self._keyboard_enabled:
+            return
+        self._keyboard_enabled = True
+        self.bind_all("<KeyPress>", self._on_key_press)
+        self.bind_all("<KeyRelease>", self._on_key_release)
+        self.teleop_status.set("Keyboard: enabled")
+        self._log("[KEYBOARD] enabled")
+
+    def disable_keyboard(self):
+        if not self._keyboard_enabled:
+            return
+        self._keyboard_enabled = False
+        self.unbind_all("<KeyPress>")
+        self.unbind_all("<KeyRelease>")
+        self._keys_down.clear()
+        self._set_target_move(0.0, 0.0, 0.0, update_ts=True)
+        self.teleop_status.set("Keyboard: disabled")
+        self._log("[KEYBOARD] disabled")
+
+    def _on_key_press(self, event):
+        if not self._keyboard_enabled:
+            return
+        self._keys_down.add(event.keysym.lower())
+        self._apply_keyboard_motion()
+
+    def _on_key_release(self, event):
+        if not self._keyboard_enabled:
+            return
+        self._keys_down.discard(event.keysym.lower())
+        self._apply_keyboard_motion()
+
+    def _apply_keyboard_motion(self):
+        step_v = 0.45 * float(self.gvx.get())
+        step_lat = 0.45 * float(self.gvy.get())
+        step_yaw = 0.60 * float(self.gwz.get())
+        vx = (step_v if "z" in self._keys_down or "w" in self._keys_down else 0.0) + (-step_v if "s" in self._keys_down else 0.0)
+        vy = (step_lat if "q" in self._keys_down or "a" in self._keys_down else 0.0) + (-step_lat if "d" in self._keys_down else 0.0)
+        wz = (step_yaw if "e" in self._keys_down else 0.0) + (-step_yaw if "r" in self._keys_down else 0.0)
+        self._set_target_move(vx, vy, wz, update_ts=True)
+        self.motion_var.set(f"vx={vx:+.2f}  vy={vy:+.2f}  wz={wz:+.2f}")
 
     # ---------- watchdog ----------
     def _start_watchdog(self):
@@ -702,10 +934,9 @@ class App(tk.Tk):
         def loop():
             while self._watchdog_running:
                 timeout = float(self.wd_var.get()) if hasattr(self, "wd_var") else float(self.cfg.data.get("safety",{}).get("watchdog_timeout_sec",0.6))
-                if self.transport and self._gamepad_running:
+                if self.transport and (self._gamepad_running or self._keyboard_enabled):
                     if now() - self.last_input_ts > timeout:
-                        # stop repeats
-                        self.transport.send_move(0.0, 0.0, 0.0)
+                        self._set_target_move(0.0, 0.0, 0.0)
                 time.sleep(0.1)
 
         self._watchdog_thread = threading.Thread(target=loop, daemon=True)
@@ -714,6 +945,8 @@ class App(tk.Tk):
     def on_close(self):
         try:
             self._watchdog_running = False
+            self._send_running = False
+            self.disable_keyboard()
             self.stop_gamepad()
             self.stop_video()
             if self.transport:
