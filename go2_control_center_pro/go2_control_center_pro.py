@@ -138,16 +138,21 @@ class Sdk2Transport(TransportBase):
         self.log = log
         self.sport = None
         self.vui = None
+        self.last_error = ""
 
     def connect(self, cfg):
         try:
             from unitree.robot.go2.sport.sport_client import SportClient
             self.sport = SportClient()
             if not self.sport.Init():
+                self.last_error = "SportClient Init failed"
                 self.log("[SDK2] SportClient Init failed")
                 return False
         except Exception as e:
+            self.last_error = str(e)
             self.log(f"[SDK2] Import/Init failed: {e}")
+            if "No module named 'unitree'" in str(e):
+                self.log("[SDK2] hint: install unitree_sdk2_python so the 'unitree' module is available")
             return False
 
         try:
@@ -159,6 +164,7 @@ class Sdk2Transport(TransportBase):
             self.log(f"[SDK2] Vui not available: {e}")
 
         self.log("[SDK2] Connected")
+        self.last_error = ""
         return True
 
     def send_move(self, vx, vy, wz):
@@ -549,6 +555,14 @@ class App(tk.Tk):
             return
 
         ok = self.transport.connect(self.cfg.data)
+        if (not ok) and name == "sdk2":
+            reason = getattr(self.transport, "last_error", "")
+            if "No module named 'unitree'" in reason:
+                self._log("[NET] SDK2 unavailable on this machine, fallback to UDP JSON transport")
+                self.transport.close()
+                self.transport = UdpJsonTransport(self._log)
+                ok = self.transport.connect(self.cfg.data)
+                name = "udp_json"
         if ok:
             self.status_var.set(f"Connected via {name}")
         else:

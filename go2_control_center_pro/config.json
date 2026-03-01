@@ -7,7 +7,7 @@
     "json_port": 8082
   },
   "video": {
-    "enabled": false,
+    "enabled": true,
     "mode": "MJPEG",
     "url": "http://192.168.12.1:8080/mjpeg"
   },
