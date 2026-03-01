@@ -22,6 +22,109 @@ def apply_deadzone(x, dz):
     s = 1 if x >= 0 else -1
     return s * (abs(x) - dz) / (1.0 - dz)
 
+def is_http_url(url):
+    parsed = urlparse(url)
+    return (parsed.scheme or "http").lower() in ("http", "https")
+
+def build_mjpeg_candidates(url):
+    """Build a short list of likely MJPEG endpoints from a user-provided URL."""
+    parsed = urlparse(url)
+    scheme = parsed.scheme or "http"
+    host = parsed.hostname
+    if not host:
+        return [url]
+
+    # Keep probing conservative: same host and same port only.
+    # Unitree Go2 architecture does not expose a guaranteed built-in MJPEG endpoint,
+    # so users usually rely on an explicit bridge URL.
+    port = parsed.port or (443 if scheme == "https" else 80)
+    base_path = parsed.path or "/mjpeg"
+    common_paths = [base_path, "/mjpeg", "/stream", "/stream.mjpg", "/video"]
+
+    candidates = []
+    seen = set()
+    for path in common_paths:
+        candidate = f"{scheme}://{host}:{int(port)}{path}"
+        if candidate not in seen:
+            candidates.append(candidate)
+            seen.add(candidate)
+    return candidates
+
+
+
+
+def check_tcp_port(host, port, timeout=2.0):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        return sock.connect_ex((host, int(port))) == 0
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+def list_ethernet_ipv4_candidates(log=None):
+    """Best-effort detection of local Ethernet IPv4 addresses using OS commands."""
+    cmd = ["ipconfig"] if platform.system().lower().startswith("win") else ["ip", "-4", "addr"]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=4)
+        out = p.stdout or ""
+    except Exception as e:
+        if callable(log):
+            log(f"[ETH] interface detection error: {e}")
+        return []
+
+    lines = out.splitlines()
+    candidates = []
+
+    if platform.system().lower().startswith("win"):
+        current_adapter = ""
+        for raw in lines:
+            line = raw.strip()
+            low = line.lower()
+            if line.endswith(":"):
+                current_adapter = line[:-1]
+                continue
+            if ("ipv4" in low or "adresse ipv4" in low) and ":" in line:
+                ip = line.split(":", 1)[1].strip().split("(")[0].strip()
+                adapter_low = current_adapter.lower()
+                if ("ethernet" in adapter_low or "eth" in adapter_low) and ip and ip != "127.0.0.1":
+                    candidates.append((current_adapter, ip))
+    else:
+        current_adapter = ""
+        for raw in lines:
+            line = raw.strip()
+            if not line:
+                continue
+            if line and line[0].isdigit() and ":" in line:
+                # format: "2: eth0: <...>"
+                current_adapter = line.split(":", 2)[1].strip()
+                continue
+            if line.startswith("inet "):
+                ip = line.split()[1].split("/")[0]
+                low = current_adapter.lower()
+                if ("eth" in low or "en" in low) and ip != "127.0.0.1":
+                    candidates.append((current_adapter, ip))
+
+    # deduplicate
+    seen = set()
+    uniq = []
+    for adapter, ip in candidates:
+        key = (adapter, ip)
+        if key not in seen:
+            seen.add(key)
+            uniq.append((adapter, ip))
+    return uniq
+
+def build_video_architecture_hint(url):
+    parsed = urlparse(url)
+    host = parsed.hostname or "robot"
+    return (
+        f". On Go2, no default MJPEG endpoint is guaranteed by Unitree architecture; "
+        f"video is commonly transported via WebRTC/DTLS or other streams, so configure "
+        f"an explicit MJPEG bridge/server URL for {host}."
+    )
+
 class Config:
     def __init__(self):
         self.data = {}
@@ -213,14 +316,51 @@ class VideoMJPEGViewer(ttk.Frame):
 
         if self._running:
             return True
+        if not is_http_url(url):
+            hint = "Video tab supports MJPEG over HTTP(S). For Go2 WebRTC/DTLS streams, use a bridge to MJPEG first."
+            self.log(f"[VIDEO] unsupported URL scheme for built-in viewer: {url}. {hint}")
+            self.canvas.configure(text=f"Video error: {hint}", image="")
+            return False
+
         self._running = True
         self.canvas.configure(text="Connecting video...", image="")
+
+        candidates = build_mjpeg_candidates(url)
+        if len(candidates) > 1:
+            self.log("[VIDEO] trying same-port endpoints: " + " | ".join(candidates[:4]) + (" ..." if len(candidates) > 4 else ""))
+
         def loop():
             import requests
             from PIL import Image, ImageTk
+            last_error = None
+            chosen_url = None
+
+            for candidate in candidates:
+                if not self._running:
+                    break
+                try:
+                    r = requests.get(candidate, stream=True, timeout=3)
+                    if r.status_code >= 400:
+                        raise requests.HTTPError(f"HTTP {r.status_code}")
+                    chosen_url = candidate
+                    break
+                except Exception as e:
+                    last_error = e
+                    self.log(f"[VIDEO] endpoint failed: {candidate} -> {e}")
+
+            if not chosen_url:
+                err_text = str(last_error) if last_error else "unknown error"
+                hint = ""
+                if "Failed to establish a new connection" in err_text or "10061" in err_text:
+                    hint = build_video_architecture_hint(url)
+                self.log(f"[VIDEO] error: {err_text}{hint}")
+                self.canvas.after(0, lambda: self.canvas.configure(text=f"Video error: {err_text}{hint}", image=""))
+                self._running = False
+                return
+
+            self.log(f"[VIDEO] connected: {chosen_url}")
+            bytes_buf = b""
             try:
-                r = requests.get(url, stream=True, timeout=5)
-                bytes_buf = b""
                 for chunk in r.iter_content(chunk_size=4096):
                     if not self._running:
                         break
@@ -233,7 +373,6 @@ class VideoMJPEGViewer(ttk.Frame):
                         try:
                             im = Image.open(io.BytesIO(jpg))
                             im = im.convert("RGB")
-                            # resize to fit label size
                             w = max(1, self.canvas.winfo_width())
                             h = max(1, self.canvas.winfo_height())
                             im.thumbnail((w, h))
@@ -245,15 +384,8 @@ class VideoMJPEGViewer(ttk.Frame):
                         except Exception:
                             pass
             except Exception as e:
-                hint = ""
-                err_text = str(e)
-                if "Failed to establish a new connection" in err_text or "10061" in err_text:
-                    parsed = urlparse(url)
-                    host = parsed.hostname or "robot"
-                    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-                    hint = f" (connection refused on {host}:{port})"
-                self.log(f"[VIDEO] error: {e}{hint}")
-                self.canvas.after(0, lambda: self.canvas.configure(text=f"Video error: {e}{hint}", image=""))
+                self.log(f"[VIDEO] stream error: {e}")
+                self.canvas.after(0, lambda: self.canvas.configure(text=f"Video stream error: {e}", image=""))
             self._running = False
         import io
         self._thread = threading.Thread(target=loop, daemon=True)
@@ -397,6 +529,8 @@ class App(tk.Tk):
         tbtns.grid(row=7, column=0, sticky="ew", pady=8)
         ttk.Button(tbtns, text="ICMP Ping (OS ping)", command=self.icmp_ping).pack(side="left")
         ttk.Button(tbtns, text="UDP Ping (send test packet)", command=self.udp_ping).pack(side="left", padx=8)
+        ttk.Button(tbtns, text="Diagnostic réseau", command=self.network_diagnosis).pack(side="left", padx=8)
+        ttk.Button(tbtns, text="Ethernet check", command=self.ethernet_connection_check).pack(side="left", padx=8)
 
     def _build_teleop_tab(self):
         f = self.tab_teleop
@@ -469,12 +603,24 @@ class App(tk.Tk):
                 __import__(mod if mod != "PIL" else "PIL.Image")
             except Exception:
                 missing.append(mod)
+
+        sdk2_ready = True
+        try:
+            from unitree.robot.go2.sport.sport_client import SportClient  # noqa: F401
+        except Exception:
+            sdk2_ready = False
+
         if missing:
             self.dep_var.set("Missing: " + ", ".join(missing))
             self._log("[SETUP] Missing deps: " + ", ".join(missing))
         else:
             self.dep_var.set("OK: all dependencies available")
             self._log("[SETUP] All deps OK")
+
+        if sdk2_ready:
+            self._log("[SETUP] SDK2 base library detected (movement control ready with transport=sdk2)")
+        else:
+            self._log("[SETUP] SDK2 base library missing. Install 'unitree-sdk2py' for real robot movement.")
 
     def install_deps(self):
         if self._deps_installing:
@@ -592,6 +738,104 @@ class App(tk.Tk):
         except Exception as e:
             self._log(f"[UDP] ping error: {e}")
             messagebox.showerror("UDP Ping", str(e))
+
+
+    def network_diagnosis(self):
+        ip = self.ip_entry.get().strip()
+        if not ip:
+            messagebox.showerror("Diagnostic", "Robot IP is empty")
+            return
+
+        video_cfg = self.cfg.data.get("video", {})
+        video_url = str(video_cfg.get("url", "")).strip()
+        video_host = None
+        video_port = None
+        if video_url:
+            parsed = urlparse(video_url)
+            video_host = parsed.hostname
+            if parsed.hostname:
+                video_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+        udp_port = int(self.cfg.data.get("udp", {}).get("robot_port", 8082))
+        count_flag = "-n" if platform.system().lower().startswith("win") else "-c"
+        cmd = ["ping", count_flag, "1", ip]
+
+        self._log("[DIAG] starting network diagnosis")
+        self._log("[DIAG] " + " ".join(cmd))
+
+        def run():
+            ping_ok = False
+            try:
+                p = subprocess.run(cmd, capture_output=True, text=True, timeout=6)
+                self._log(p.stdout.strip() or p.stderr.strip())
+                ping_ok = (p.returncode == 0)
+            except Exception as e:
+                self._log(f"[DIAG] ping error: {e}")
+
+            if ping_ok:
+                self._log(f"[DIAG] ICMP OK -> {ip}")
+            else:
+                self._log(f"[DIAG] ICMP FAILED -> {ip}")
+
+            # UDP note: no handshake, only best-effort send visibility.
+            self._log(f"[DIAG] UDP command channel target: {ip}:{udp_port} (no handshake by design)")
+
+            if video_host and video_port:
+                tcp_ok = check_tcp_port(video_host, video_port, timeout=2.5)
+                if tcp_ok:
+                    self._log(f"[DIAG] TCP video port OPEN -> {video_host}:{video_port}")
+                else:
+                    self._log(f"[DIAG] TCP video port CLOSED/REFUSED -> {video_host}:{video_port}")
+                    self._log("[DIAG] hint: start/configure a MJPEG bridge/server and verify URL in Video tab")
+
+            if ping_ok and not self.transport:
+                self._log("[DIAG] hint: network reachable, now connect transport in Setup tab")
+
+            if ping_ok:
+                messagebox.showinfo("Diagnostic réseau", "Diagnostic terminé. Voir l'onglet Logs pour le détail.")
+            else:
+                messagebox.showwarning("Diagnostic réseau", "Ping ICMP échoué. Vérifie Wi-Fi, IP robot et interface réseau.")
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def ethernet_connection_check(self):
+        ip = self.ip_entry.get().strip()
+        if not ip:
+            messagebox.showerror("Ethernet", "Robot IP is empty")
+            return
+
+        self._log("[ETH] starting Ethernet connection check")
+
+        def run():
+            adapters = list_ethernet_ipv4_candidates(log=self._log)
+            if adapters:
+                self._log("[ETH] local Ethernet IPv4: " + " | ".join([f"{a}={v}" for a, v in adapters]))
+            else:
+                self._log("[ETH] no active Ethernet IPv4 adapter detected")
+
+            count_flag = "-n" if platform.system().lower().startswith("win") else "-c"
+            cmd = ["ping", count_flag, "1", ip]
+            self._log("[ETH] " + " ".join(cmd))
+
+            ping_ok = False
+            try:
+                p = subprocess.run(cmd, capture_output=True, text=True, timeout=6)
+                self._log(p.stdout.strip() or p.stderr.strip())
+                ping_ok = (p.returncode == 0)
+            except Exception as e:
+                self._log(f"[ETH] ping error: {e}")
+
+            if ping_ok:
+                self._log(f"[ETH] robot reachable from host -> {ip}")
+                messagebox.showinfo("Ethernet", "Ethernet check OK (robot reachable).")
+            else:
+                self._log(f"[ETH] robot unreachable -> {ip}")
+                self._log("[ETH] hint: verify cable, NIC state, IP subnet (ex: PC 192.168.12.x / robot 192.168.12.1)")
+                if not adapters:
+                    self._log("[ETH] hint: no Ethernet adapter detected/enabled on this host")
+                messagebox.showwarning("Ethernet", "Ethernet check failed (see Logs tab).")
+
+        threading.Thread(target=run, daemon=True).start()
 
     def apply_video(self):
         self.cfg.data.setdefault("video", {})
