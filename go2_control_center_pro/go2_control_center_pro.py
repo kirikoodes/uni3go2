@@ -538,12 +538,24 @@ class App(tk.Tk):
                 __import__(mod if mod != "PIL" else "PIL.Image")
             except Exception:
                 missing.append(mod)
+
+        sdk2_ready = True
+        try:
+            from unitree.robot.go2.sport.sport_client import SportClient  # noqa: F401
+        except Exception:
+            sdk2_ready = False
+
         if missing:
             self.dep_var.set("Missing: " + ", ".join(missing))
             self._log("[SETUP] Missing deps: " + ", ".join(missing))
         else:
             self.dep_var.set("OK: all dependencies available")
             self._log("[SETUP] All deps OK")
+
+        if sdk2_ready:
+            self._log("[SETUP] SDK2 base library detected (movement control ready with transport=sdk2)")
+        else:
+            self._log("[SETUP] SDK2 base library missing. Install 'unitree-sdk2py' for real robot movement.")
 
     def install_deps(self):
         if self._deps_installing:
