@@ -1,6 +1,7 @@
 
 # -*- coding: utf-8 -*-
 import os, sys, json, time, threading, socket, subprocess, platform
+from urllib.parse import urlparse
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -244,8 +245,15 @@ class VideoMJPEGViewer(ttk.Frame):
                         except Exception:
                             pass
             except Exception as e:
-                self.log(f"[VIDEO] error: {e}")
-                self.canvas.after(0, lambda: self.canvas.configure(text=f"Video error: {e}", image=""))
+                hint = ""
+                err_text = str(e)
+                if "Failed to establish a new connection" in err_text or "10061" in err_text:
+                    parsed = urlparse(url)
+                    host = parsed.hostname or "robot"
+                    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+                    hint = f" (connection refused on {host}:{port})"
+                self.log(f"[VIDEO] error: {e}{hint}")
+                self.canvas.after(0, lambda: self.canvas.configure(text=f"Video error: {e}{hint}", image=""))
             self._running = False
         import io
         self._thread = threading.Thread(target=loop, daemon=True)
@@ -275,6 +283,8 @@ class App(tk.Tk):
 
         self._watchdog_thread = None
         self._watchdog_running = True
+
+        self._deps_installing = False
 
         self._build_ui()
         self._start_watchdog()
@@ -467,6 +477,12 @@ class App(tk.Tk):
             self._log("[SETUP] All deps OK")
 
     def install_deps(self):
+        if self._deps_installing:
+            self._log("[SETUP] Install already in progress")
+            return
+
+        self._deps_installing = True
+
         # run pip in a background thread
         def run():
             self._log("[SETUP] Installing dependencies...")
@@ -480,6 +496,9 @@ class App(tk.Tk):
                 self.check_deps()
             except Exception as e:
                 self._log(f"[SETUP] install error: {e}")
+            finally:
+                self._deps_installing = False
+
         threading.Thread(target=run, daemon=True).start()
 
     def save_network_cfg(self):
