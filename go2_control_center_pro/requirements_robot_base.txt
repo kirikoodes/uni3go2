@@ -1,0 +1,4 @@
+# Optional base dependencies to control real Go2 movement via SDK2.
+# Install manually when you want hardware control:
+#   pip install -r requirements_robot_base.txt
+unitree-sdk2py
